@@ -1,0 +1,23 @@
+resources:
+  pipelines:
+    medquad_data_pipeline:
+      name: MedQuAD Data Pipeline
+
+      libraries:
+        - notebook:
+            path: ../notebooks/pipeline/01_bronze_ingestion.py
+
+        - notebook:
+            path: ../notebooks/pipeline/02_silver_cleaning.py
+
+        - notebook:
+            path: ../notebooks/pipeline/03_gold_rag_preparation.py
+
+      catalog: dbacademy
+      schema: medquad_project
+      channel: CURRENT
+      continuous: false
+      photon: true
+      serverless: true
+
+      root_path: ../notebooks/pipeline

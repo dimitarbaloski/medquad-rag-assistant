@@ -1,0 +1,35 @@
+resources:
+  jobs:
+    medquad_rag_refresh:
+      name: MedQuAD RAG Data and Index Refresh
+
+      max_concurrent_runs: 1
+
+      queue:
+        enabled: true
+
+      performance_target: PERFORMANCE_OPTIMIZED
+
+      email_notifications:
+        no_alert_for_skipped_runs: false
+
+      tasks:
+        - task_key: run_medquad_pipeline
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.medquad_data_pipeline.id}
+
+        - task_key: create_vector_search_source
+          depends_on:
+            - task_key: run_medquad_pipeline
+
+          notebook_task:
+            notebook_path: ../notebooks/vector_search/01_vector_search_setup.sql
+            source: WORKSPACE
+
+        - task_key: sync_vector_search_index
+          depends_on:
+            - task_key: create_vector_search_source
+
+          notebook_task:
+            notebook_path: ../notebooks/vector_search/03_sync_vector_search_index.sql
+            source: WORKSPACE

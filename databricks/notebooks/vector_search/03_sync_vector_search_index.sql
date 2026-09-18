@@ -1,0 +1,9 @@
+-- Databricks notebook source
+-- MAGIC %python
+-- MAGIC from databricks.sdk import WorkspaceClient
+-- MAGIC
+-- MAGIC workspace = WorkspaceClient()
+-- MAGIC
+-- MAGIC workspace.vector_search_indexes.sync_index(
+-- MAGIC     index_name="dbacademy.medquad_project.medquad_rag_index"
+-- MAGIC )

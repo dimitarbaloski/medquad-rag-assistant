@@ -1,0 +1,12 @@
+bundle:
+  name: medquad-rag-assistant
+
+include:
+  - databricks/resources/*.yml
+
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://dbc-b3886efa-f139.cloud.databricks.com

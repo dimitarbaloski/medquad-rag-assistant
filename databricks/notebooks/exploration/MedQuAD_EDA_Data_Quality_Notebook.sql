@@ -1,0 +1,2624 @@
+-- Databricks notebook source
+-- MAGIC %md
+-- MAGIC # MedQuAD Exploratory Data Analysis and Data Quality Validation
+-- MAGIC
+-- MAGIC This notebook documents the exploratory data analysis used to decide how MedQuAD should move from the raw **Bronze** layer into a clean **Silver** question-answer dataset and later into a **Gold/RAG** representation.
+-- MAGIC
+-- MAGIC
+-- MAGIC The code-cell titles are enabled so each transformation is easy to identify in Databricks. Stale outputs have been cleared so the notebook can be rerun cleanly from top to bottom.
+-- MAGIC
+
+-- COMMAND ----------
+
+-- MAGIC %md
+-- MAGIC ## 1. Load and Inspect the Raw Dataset
+-- MAGIC
+-- MAGIC Load the MedQuAD Parquet file and inspect the raw schema/content before applying any data-quality assumptions.
+-- MAGIC
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC from pyspark.sql import functions as F
+-- MAGIC
+-- MAGIC PARQUET_PATH = (
+-- MAGIC     "/Volumes/dbacademy/medquad_project/raw/medquad/train-00000-of-00001-e36383d177026d53.parquet"
+-- MAGIC )
+-- MAGIC
+-- MAGIC medquad_df = spark.read.parquet(PARQUET_PATH)
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC display(medquad_df)
+
+-- COMMAND ----------
+
+-- MAGIC %md
+-- MAGIC ## 2. Missing Values
+-- MAGIC
+-- MAGIC MedQuAD contains real nulls, empty strings, and the literal value `\N`. This section measures missingness before deciding which fields are required and which are optional.
+-- MAGIC
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC from pyspark.sql import functions as F
+-- MAGIC
+-- MAGIC missing_counts = medquad_df.select([
+-- MAGIC     F.count(
+-- MAGIC         F.when(
+-- MAGIC             F.col(c).isNull()
+-- MAGIC             | (F.trim(F.col(c).cast("string")) == "")
+-- MAGIC             | (F.trim(F.col(c).cast("string")) == "\\N"),
+-- MAGIC             c
+-- MAGIC         )
+-- MAGIC     ).alias(c)
+-- MAGIC     for c in medquad_df.columns
+-- MAGIC ])
+-- MAGIC
+-- MAGIC display(missing_counts)
+
+-- COMMAND ----------
+
+-- MAGIC %md
+-- MAGIC ## 3. UMLS CUI Structure
+-- MAGIC
+-- MAGIC Some UMLS fields contain more than one value. These early checks explore how the values are encoded before the final Silver representation is chosen.
+-- MAGIC
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC from pyspark.sql import functions as F
+-- MAGIC
+-- MAGIC cui_exploration_df = medquad_df.withColumn(
+-- MAGIC     "umls_cui_list",
+-- MAGIC     F.split(F.col("umls_cui"), "\\|")
+-- MAGIC )
+-- MAGIC
+-- MAGIC display(cui_exploration_df)
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC display(
+-- MAGIC     cui_exploration_df.select(
+-- MAGIC         "question_focus",
+-- MAGIC         "umls_cui",
+-- MAGIC         "umls_cui_list"
+-- MAGIC     )
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC
+-- MAGIC cui_exploration_df = cui_exploration_df.withColumn(
+-- MAGIC     "umls_cui_count",
+-- MAGIC     F.size(F.col("umls_cui_list"))
+-- MAGIC )
+-- MAGIC
+-- MAGIC
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC display(
+-- MAGIC     cui_exploration_df
+-- MAGIC     .select(
+-- MAGIC         "question_focus",
+-- MAGIC         "umls_cui",
+-- MAGIC         "umls_cui_count"
+-- MAGIC     )
+-- MAGIC     .orderBy(F.desc("umls_cui_count"))
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %md
+-- MAGIC ## 4. Duplicate Records and Question–Answer Pairs
+-- MAGIC
+-- MAGIC First distinguish **full-row duplicates** from repeated question-answer pairs. A repeated QA pair can be redundant even when the complete source rows are not byte-for-byte identical.
+-- MAGIC
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC total_rows = medquad_df.count()
+-- MAGIC
+-- MAGIC unique_rows = medquad_df.dropDuplicates().count()
+-- MAGIC
+-- MAGIC exact_duplicates = total_rows - unique_rows
+-- MAGIC
+-- MAGIC print("Total rows:", total_rows)
+-- MAGIC print("Unique rows:", unique_rows)
+-- MAGIC print("Exact duplicate rows:", exact_duplicates)
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC from pyspark.sql import functions as F
+-- MAGIC
+-- MAGIC duplicate_qa = (
+-- MAGIC     medquad_df
+-- MAGIC     .groupBy("question", "answer")
+-- MAGIC     .count()
+-- MAGIC     .filter(F.col("count") > 1)
+-- MAGIC     .orderBy(F.desc("count"))
+-- MAGIC )
+-- MAGIC
+-- MAGIC display(duplicate_qa)
+
+-- COMMAND ----------
+
+-- MAGIC %md
+-- MAGIC ## 5. Answer Availability
+-- MAGIC
+-- MAGIC A RAG question-answer dataset requires usable answer content. These cells identify answered versus unanswered rows and show where missing answers occur.
+-- MAGIC
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC from pyspark.sql import functions as F
+-- MAGIC
+-- MAGIC eda_df = medquad_df.withColumn(
+-- MAGIC     "answer_missing",
+-- MAGIC     F.col("answer").isNull()
+-- MAGIC     | (F.trim(F.col("answer")) == "")
+-- MAGIC     | (F.trim(F.col("answer")) == "\\N")
+-- MAGIC )
+-- MAGIC
+-- MAGIC eda_df.groupBy("answer_missing").count().show()
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC display(
+-- MAGIC     eda_df
+-- MAGIC     .groupBy("document_source")
+-- MAGIC     .agg(
+-- MAGIC         F.count("*").alias("total_rows"),
+-- MAGIC
+-- MAGIC         F.sum(
+-- MAGIC             F.when(F.col("answer_missing"), 1).otherwise(0)
+-- MAGIC         ).alias("missing_answers"),
+-- MAGIC
+-- MAGIC         F.sum(
+-- MAGIC             F.when(~F.col("answer_missing"), 1).otherwise(0)
+-- MAGIC         ).alias("available_answers")
+-- MAGIC     )
+-- MAGIC     .withColumn(
+-- MAGIC         "missing_percentage",
+-- MAGIC         F.round(
+-- MAGIC             F.col("missing_answers")
+-- MAGIC             / F.col("total_rows")
+-- MAGIC             * 100,
+-- MAGIC             2
+-- MAGIC         )
+-- MAGIC     )
+-- MAGIC     .orderBy(F.desc("missing_percentage"))
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC display(
+-- MAGIC     eda_df
+-- MAGIC     .groupBy("question_type")
+-- MAGIC     .agg(
+-- MAGIC         F.count("*").alias("total_rows"),
+-- MAGIC
+-- MAGIC         F.sum(
+-- MAGIC             F.when(F.col("answer_missing"), 1).otherwise(0)
+-- MAGIC         ).alias("missing_answers"),
+-- MAGIC
+-- MAGIC         F.sum(
+-- MAGIC             F.when(~F.col("answer_missing"), 1).otherwise(0)
+-- MAGIC         ).alias("available_answers")
+-- MAGIC     )
+-- MAGIC     .withColumn(
+-- MAGIC         "missing_percentage",
+-- MAGIC         F.round(
+-- MAGIC             F.col("missing_answers")
+-- MAGIC             / F.col("total_rows")
+-- MAGIC             * 100,
+-- MAGIC             2
+-- MAGIC         )
+-- MAGIC     )
+-- MAGIC     .orderBy(F.desc("total_rows"))
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC display(
+-- MAGIC     eda_df
+-- MAGIC     .filter(F.col("answer_missing"))
+-- MAGIC     .select(
+-- MAGIC         "document_source",
+-- MAGIC         "question_focus",
+-- MAGIC         "synonyms",
+-- MAGIC         "question_type",
+-- MAGIC         "question",
+-- MAGIC         "answer"
+-- MAGIC     )
+-- MAGIC     .limit(50)
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC display(
+-- MAGIC     eda_df
+-- MAGIC     .filter(~F.col("answer_missing"))
+-- MAGIC     .select(
+-- MAGIC         "document_source",
+-- MAGIC         "question_focus",
+-- MAGIC         "synonyms",
+-- MAGIC         "question_type",
+-- MAGIC         "question",
+-- MAGIC         "answer"
+-- MAGIC     )
+-- MAGIC     .limit(50)
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %md
+-- MAGIC ## 6. Answer Length and Short-Answer Exploration
+-- MAGIC
+-- MAGIC Answer length is useful for EDA, but length alone is **not** treated as a quality rule. Short answers can be valid, and long answers can contain useful detailed medical content.
+-- MAGIC
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC answered_df = eda_df.filter(
+-- MAGIC     ~F.col("answer_missing")
+-- MAGIC )
+-- MAGIC
+-- MAGIC answer_length_df = answered_df.withColumn(
+-- MAGIC     "answer_length",
+-- MAGIC     F.length(F.col("answer"))
+-- MAGIC )
+-- MAGIC
+-- MAGIC display(
+-- MAGIC     answer_length_df.select(
+-- MAGIC         F.min("answer_length").alias("min_length"),
+-- MAGIC         F.avg("answer_length").alias("avg_length"),
+-- MAGIC         F.max("answer_length").alias("max_length")
+-- MAGIC     )
+-- MAGIC )
+-- MAGIC
+-- MAGIC display(
+-- MAGIC     answer_length_df.select(
+-- MAGIC         F.expr("""
+-- MAGIC             percentile_approx(
+-- MAGIC                 answer_length,
+-- MAGIC                 array(0.25, 0.5, 0.75, 0.90, 0.95, 0.99)
+-- MAGIC             )
+-- MAGIC         """).alias("answer_length_percentiles")
+-- MAGIC     )
+-- MAGIC )
+-- MAGIC
+-- MAGIC display(
+-- MAGIC     answer_length_df
+-- MAGIC     .select(
+-- MAGIC         "document_source",
+-- MAGIC         "question_focus",
+-- MAGIC         "question_type",
+-- MAGIC         "question",
+-- MAGIC         "answer",
+-- MAGIC         "answer_length"
+-- MAGIC     )
+-- MAGIC     .orderBy("answer_length")
+-- MAGIC     .limit(30)
+-- MAGIC )
+-- MAGIC
+-- MAGIC display(
+-- MAGIC     answer_length_df
+-- MAGIC     .select(
+-- MAGIC         "document_source",
+-- MAGIC         "question_focus",
+-- MAGIC         "question_type",
+-- MAGIC         "question",
+-- MAGIC         "answer",
+-- MAGIC         "answer_length"
+-- MAGIC     )
+-- MAGIC     .orderBy(F.desc("answer_length"))
+-- MAGIC     .limit(30)
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC from pyspark.sql import functions as F
+-- MAGIC
+-- MAGIC answer_length_buckets_df = (
+-- MAGIC     answer_length_df
+-- MAGIC     .withColumn(
+-- MAGIC         "length_bucket",
+-- MAGIC         F.when(F.col("answer_length") <= 50, "0-50")
+-- MAGIC          .when(F.col("answer_length") <= 100, "51-100")
+-- MAGIC          .when(F.col("answer_length") <= 250, "101-250")
+-- MAGIC          .when(F.col("answer_length") <= 500, "251-500")
+-- MAGIC          .when(F.col("answer_length") <= 1000, "501-1000")
+-- MAGIC          .when(F.col("answer_length") <= 2000, "1001-2000")
+-- MAGIC          .when(F.col("answer_length") <= 5000, "2001-5000")
+-- MAGIC          .otherwise("5000+")
+-- MAGIC     )
+-- MAGIC )
+-- MAGIC
+-- MAGIC display(
+-- MAGIC     answer_length_buckets_df
+-- MAGIC     .groupBy("length_bucket")
+-- MAGIC     .count()
+-- MAGIC     .orderBy(
+-- MAGIC         F.when(F.col("length_bucket") == "0-50", 1)
+-- MAGIC          .when(F.col("length_bucket") == "51-100", 2)
+-- MAGIC          .when(F.col("length_bucket") == "101-250", 3)
+-- MAGIC          .when(F.col("length_bucket") == "251-500", 4)
+-- MAGIC          .when(F.col("length_bucket") == "501-1000", 5)
+-- MAGIC          .when(F.col("length_bucket") == "1001-2000", 6)
+-- MAGIC          .when(F.col("length_bucket") == "2001-5000", 7)
+-- MAGIC          .otherwise(8)
+-- MAGIC     )
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC short_answers_df = answer_length_df.filter(
+-- MAGIC     F.col("answer_length") <= 100
+-- MAGIC )
+-- MAGIC
+-- MAGIC display(
+-- MAGIC     short_answers_df
+-- MAGIC     .groupBy("document_source")
+-- MAGIC     .count()
+-- MAGIC     .orderBy(F.desc("count"))
+-- MAGIC )
+-- MAGIC
+-- MAGIC display(
+-- MAGIC     short_answers_df
+-- MAGIC     .groupBy("question_type")
+-- MAGIC     .count()
+-- MAGIC     .orderBy(F.desc("count"))
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %md
+-- MAGIC ## 7. Question/Answer Normalization and Repeated Questions
+-- MAGIC
+-- MAGIC Normalize text for comparison and inspect repeated questions. The important distinction is:
+-- MAGIC
+-- MAGIC - same question + same answer → true QA duplicate candidate;
+-- MAGIC - same question + different answer → potentially complementary information.
+-- MAGIC
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC question_answer_comparison_df = (
+-- MAGIC     answered_df
+-- MAGIC     .withColumn(
+-- MAGIC         "normalized_question",
+-- MAGIC         F.lower(
+-- MAGIC             F.regexp_replace(
+-- MAGIC                 F.trim(F.col("question")),
+-- MAGIC                 r"[^a-zA-Z0-9 ]",
+-- MAGIC                 ""
+-- MAGIC             )
+-- MAGIC         )
+-- MAGIC     )
+-- MAGIC     .withColumn(
+-- MAGIC         "normalized_answer",
+-- MAGIC         F.lower(
+-- MAGIC             F.regexp_replace(
+-- MAGIC                 F.trim(F.col("answer")),
+-- MAGIC                 r"[^a-zA-Z0-9 ]",
+-- MAGIC                 ""
+-- MAGIC             )
+-- MAGIC         )
+-- MAGIC     )
+-- MAGIC )
+-- MAGIC
+-- MAGIC same_question_answer_df = (
+-- MAGIC     question_answer_comparison_df
+-- MAGIC     .filter(
+-- MAGIC         F.col("normalized_question")
+-- MAGIC         == F.col("normalized_answer")
+-- MAGIC     )
+-- MAGIC )
+-- MAGIC
+-- MAGIC print(
+-- MAGIC     "Rows where answer equals question:",
+-- MAGIC     same_question_answer_df.count()
+-- MAGIC )
+-- MAGIC
+-- MAGIC display(
+-- MAGIC     same_question_answer_df
+-- MAGIC     .select(
+-- MAGIC         "document_source",
+-- MAGIC         "question_focus",
+-- MAGIC         "question_type",
+-- MAGIC         "question",
+-- MAGIC         "answer"
+-- MAGIC     )
+-- MAGIC )
+-- MAGIC
+-- MAGIC
+-- MAGIC display(
+-- MAGIC     answer_length_df
+-- MAGIC     .groupBy("document_source")
+-- MAGIC     .agg(
+-- MAGIC         F.count("*").alias("rows"),
+-- MAGIC         F.round(F.avg("answer_length"), 2).alias("avg_length"),
+-- MAGIC         F.expr(
+-- MAGIC             "percentile_approx(answer_length, 0.5)"
+-- MAGIC         ).alias("median_length"),
+-- MAGIC         F.max("answer_length").alias("max_length")
+-- MAGIC     )
+-- MAGIC     .orderBy(F.desc("max_length"))
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC def normalize_text(column):
+-- MAGIC     return F.trim(
+-- MAGIC         F.regexp_replace(
+-- MAGIC             F.lower(
+-- MAGIC                 F.regexp_replace(
+-- MAGIC                     F.col(column),
+-- MAGIC                     r"[^a-zA-Z0-9]+",
+-- MAGIC                     " "
+-- MAGIC                 )
+-- MAGIC             ),
+-- MAGIC             r"\s+",
+-- MAGIC             " "
+-- MAGIC         )
+-- MAGIC     )
+-- MAGIC
+-- MAGIC
+-- MAGIC     question_answer_comparison_df = (
+-- MAGIC     answered_df
+-- MAGIC     .withColumn(
+-- MAGIC         "normalized_question",
+-- MAGIC         normalize_text("question")
+-- MAGIC     )
+-- MAGIC     .withColumn(
+-- MAGIC         "normalized_answer",
+-- MAGIC         normalize_text("answer")
+-- MAGIC     )
+-- MAGIC )
+-- MAGIC
+-- MAGIC     same_question_answer_df = (
+-- MAGIC     question_answer_comparison_df
+-- MAGIC     .filter(
+-- MAGIC         F.col("normalized_question")
+-- MAGIC         == F.col("normalized_answer")
+-- MAGIC     )
+-- MAGIC )
+-- MAGIC
+-- MAGIC print(
+-- MAGIC     "Rows where answer equals question:",
+-- MAGIC     same_question_answer_df.count()
+-- MAGIC )
+-- MAGIC
+-- MAGIC display(
+-- MAGIC     same_question_answer_df
+-- MAGIC     .select(
+-- MAGIC         "document_source",
+-- MAGIC         "question_focus",
+-- MAGIC         "question_type",
+-- MAGIC         "question",
+-- MAGIC         "answer"
+-- MAGIC     )
+-- MAGIC )
+-- MAGIC
+-- MAGIC
+-- MAGIC display(
+-- MAGIC     answer_length_df
+-- MAGIC     .select(
+-- MAGIC         F.sum(
+-- MAGIC             F.when(F.col("answer_length") <= 50, 1).otherwise(0)
+-- MAGIC         ).alias("50_or_less"),
+-- MAGIC
+-- MAGIC         F.sum(
+-- MAGIC             F.when(F.col("answer_length") <= 100, 1).otherwise(0)
+-- MAGIC         ).alias("100_or_less"),
+-- MAGIC
+-- MAGIC         F.sum(
+-- MAGIC             F.when(F.col("answer_length") <= 200, 1).otherwise(0)
+-- MAGIC         ).alias("200_or_less"),
+-- MAGIC
+-- MAGIC         F.sum(
+-- MAGIC             F.when(F.col("answer_length") <= 500, 1).otherwise(0)
+-- MAGIC         ).alias("500_or_less"),
+-- MAGIC
+-- MAGIC         F.count("*").alias("total_answered")
+-- MAGIC     )
+-- MAGIC )
+-- MAGIC
+-- MAGIC
+-- MAGIC display(
+-- MAGIC     answer_length_df
+-- MAGIC     .filter(F.col("answer_length") <= 100)
+-- MAGIC     .groupBy("document_source")
+-- MAGIC     .count()
+-- MAGIC     .orderBy(F.desc("count"))
+-- MAGIC )
+-- MAGIC
+-- MAGIC display(
+-- MAGIC     answer_length_df
+-- MAGIC     .filter(F.col("answer_length") <= 100)
+-- MAGIC     .groupBy("question_type")
+-- MAGIC     .count()
+-- MAGIC     .orderBy(F.desc("count"))
+-- MAGIC )
+-- MAGIC
+-- MAGIC
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC total_rows = medquad_df.count()
+-- MAGIC
+-- MAGIC unique_rows = medquad_df.dropDuplicates().count()
+-- MAGIC
+-- MAGIC print("Total rows:", total_rows)
+-- MAGIC print("Unique rows:", unique_rows)
+-- MAGIC print("Exact duplicate rows:", total_rows - unique_rows)
+-- MAGIC
+-- MAGIC from pyspark.sql import functions as F
+-- MAGIC
+-- MAGIC duplicate_qa_df = (
+-- MAGIC     medquad_df
+-- MAGIC     .filter(
+-- MAGIC         F.col("answer").isNotNull()
+-- MAGIC         & (F.trim(F.col("answer")) != "")
+-- MAGIC         & (F.trim(F.col("answer")) != "\\N")
+-- MAGIC     )
+-- MAGIC     .groupBy("question", "answer")
+-- MAGIC     .count()
+-- MAGIC     .filter(F.col("count") > 1)
+-- MAGIC     .orderBy(F.desc("count"))
+-- MAGIC )
+-- MAGIC
+-- MAGIC display(duplicate_qa_df)
+-- MAGIC
+-- MAGIC print(
+-- MAGIC     "Duplicate question-answer groups:",
+-- MAGIC     duplicate_qa_df.count()
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC duplicate_qa_details_df = (
+-- MAGIC     answered_df
+-- MAGIC     .join(
+-- MAGIC         duplicate_qa_df.select("question", "answer"),
+-- MAGIC         on=["question", "answer"],
+-- MAGIC         how="inner"
+-- MAGIC     )
+-- MAGIC     .select(
+-- MAGIC         "document_id",
+-- MAGIC         "question_id",
+-- MAGIC         "document_source",
+-- MAGIC         "document_url",
+-- MAGIC         "question_focus",
+-- MAGIC         "question_type",
+-- MAGIC         "question",
+-- MAGIC         "answer"
+-- MAGIC     )
+-- MAGIC     .orderBy(
+-- MAGIC         "question",
+-- MAGIC         "document_source"
+-- MAGIC     )
+-- MAGIC )
+-- MAGIC
+-- MAGIC display(duplicate_qa_details_df)
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC repeated_questions_df = (
+-- MAGIC     answered_df
+-- MAGIC     .groupBy("question")
+-- MAGIC     .agg(
+-- MAGIC         F.count("*").alias("row_count"),
+-- MAGIC         F.countDistinct("answer").alias("distinct_answers"),
+-- MAGIC         F.countDistinct("document_source").alias("distinct_sources")
+-- MAGIC     )
+-- MAGIC     .filter(F.col("row_count") > 1)
+-- MAGIC     .orderBy(F.desc("row_count"))
+-- MAGIC )
+-- MAGIC
+-- MAGIC display(repeated_questions_df)
+-- MAGIC
+-- MAGIC example_question = repeated_questions_df.first()["question"]
+-- MAGIC
+-- MAGIC print(example_question)
+-- MAGIC
+-- MAGIC display(
+-- MAGIC     answered_df
+-- MAGIC     .filter(F.col("question") == example_question)
+-- MAGIC     .select(
+-- MAGIC         "document_source",
+-- MAGIC         "question_focus",
+-- MAGIC         "question_type",
+-- MAGIC         "question",
+-- MAGIC         "answer"
+-- MAGIC     )
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %md
+-- MAGIC ## 8. Topic Coverage and Metadata Completeness
+-- MAGIC
+-- MAGIC Removing unanswered rows should not silently destroy useful topical coverage. These checks measure topic depth, topics without answers, missing question focus, and other optional metadata.
+-- MAGIC
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC
+-- MAGIC all_topics = medquad_df.select(
+-- MAGIC     F.countDistinct("question_focus")
+-- MAGIC     .alias("distinct_topics")
+-- MAGIC )
+-- MAGIC
+-- MAGIC answered_topics = answered_df.select(
+-- MAGIC     F.countDistinct("question_focus")
+-- MAGIC     .alias("distinct_topics")
+-- MAGIC )
+-- MAGIC
+-- MAGIC print("All dataset:")
+-- MAGIC all_topics.show()
+-- MAGIC
+-- MAGIC print("Answered rows only:")
+-- MAGIC answered_topics.show()
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC all_topic_count = (
+-- MAGIC     medquad_df
+-- MAGIC     .select(F.countDistinct("question_focus"))
+-- MAGIC     .first()[0]
+-- MAGIC )
+-- MAGIC
+-- MAGIC answered_topic_count = (
+-- MAGIC     answered_df
+-- MAGIC     .select(F.countDistinct("question_focus"))
+-- MAGIC     .first()[0]
+-- MAGIC )
+-- MAGIC
+-- MAGIC coverage_percentage = (
+-- MAGIC     answered_topic_count / all_topic_count * 100
+-- MAGIC )
+-- MAGIC
+-- MAGIC print("All distinct topics:", all_topic_count)
+-- MAGIC print("Answered distinct topics:", answered_topic_count)
+-- MAGIC print("Topic coverage:", round(coverage_percentage, 2), "%")
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC all_topic_df = (
+-- MAGIC     medquad_df
+-- MAGIC     .select("question_focus")
+-- MAGIC     .filter(F.col("question_focus").isNotNull())
+-- MAGIC     .distinct()
+-- MAGIC )
+-- MAGIC
+-- MAGIC answered_topic_df = (
+-- MAGIC     answered_df
+-- MAGIC     .select("question_focus")
+-- MAGIC     .filter(F.col("question_focus").isNotNull())
+-- MAGIC     .distinct()
+-- MAGIC )
+-- MAGIC
+-- MAGIC missing_topics_df = (
+-- MAGIC     all_topic_df
+-- MAGIC     .join(
+-- MAGIC         answered_topic_df,
+-- MAGIC         on="question_focus",
+-- MAGIC         how="left_anti"
+-- MAGIC     )
+-- MAGIC )
+-- MAGIC
+-- MAGIC print(
+-- MAGIC     "Topics with no usable answered rows:",
+-- MAGIC     missing_topics_df.count()
+-- MAGIC )
+-- MAGIC
+-- MAGIC display(missing_topics_df)
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC missing_topics_by_source_df = (
+-- MAGIC     medquad_df
+-- MAGIC     .join(
+-- MAGIC         missing_topics_df,
+-- MAGIC         on="question_focus",
+-- MAGIC         how="inner"
+-- MAGIC     )
+-- MAGIC     .groupBy("document_source")
+-- MAGIC     .agg(
+-- MAGIC         F.countDistinct("question_focus")
+-- MAGIC         .alias("missing_topics")
+-- MAGIC     )
+-- MAGIC     .orderBy(F.desc("missing_topics"))
+-- MAGIC )
+-- MAGIC
+-- MAGIC display(missing_topics_by_source_df)
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC missing_topic_source_count_df = (
+-- MAGIC     medquad_df
+-- MAGIC     .join(
+-- MAGIC         missing_topics_df,
+-- MAGIC         on="question_focus",
+-- MAGIC         how="inner"
+-- MAGIC     )
+-- MAGIC     .groupBy("question_focus")
+-- MAGIC     .agg(
+-- MAGIC         F.countDistinct("document_source")
+-- MAGIC         .alias("source_count")
+-- MAGIC     )
+-- MAGIC )
+-- MAGIC
+-- MAGIC display(
+-- MAGIC     missing_topic_source_count_df
+-- MAGIC     .groupBy("source_count")
+-- MAGIC     .count()
+-- MAGIC     .orderBy("source_count")
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC topic_answer_counts_df = (
+-- MAGIC     answered_df
+-- MAGIC     .groupBy("question_focus")
+-- MAGIC     .agg(
+-- MAGIC         F.count("*").alias("answered_rows"),
+-- MAGIC         F.countDistinct("question_type").alias("question_types")
+-- MAGIC     )
+-- MAGIC     .orderBy(F.desc("answered_rows"))
+-- MAGIC )
+-- MAGIC
+-- MAGIC display(topic_answer_counts_df)
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC display(
+-- MAGIC     topic_answer_counts_df
+-- MAGIC     .groupBy("answered_rows")
+-- MAGIC     .count()
+-- MAGIC     .orderBy("answered_rows")
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC topic_depth_stats = (
+-- MAGIC     topic_answer_counts_df
+-- MAGIC     .select(
+-- MAGIC         F.min("answered_rows").alias("min"),
+-- MAGIC         F.avg("answered_rows").alias("avg"),
+-- MAGIC         F.expr("percentile_approx(answered_rows, 0.5)").alias("median"),
+-- MAGIC         F.max("answered_rows").alias("max")
+-- MAGIC     )
+-- MAGIC )
+-- MAGIC
+-- MAGIC display(topic_depth_stats)
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC display(
+-- MAGIC     answered_df
+-- MAGIC     .filter(F.col("question_focus").isNull())
+-- MAGIC     .select(
+-- MAGIC         "document_source",
+-- MAGIC         "category",
+-- MAGIC         "question_type",
+-- MAGIC         "question_focus",
+-- MAGIC         "question",
+-- MAGIC         "answer"
+-- MAGIC     )
+-- MAGIC )
+-- MAGIC
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC from pyspark.sql import functions as F
+-- MAGIC
+-- MAGIC columns_to_check = [
+-- MAGIC     "document_id",
+-- MAGIC     "category",
+-- MAGIC     "umls_cui",
+-- MAGIC     "umls_semantic_types",
+-- MAGIC     "umls_semantic_group",
+-- MAGIC     "synonyms",
+-- MAGIC     "question_type"
+-- MAGIC ]
+-- MAGIC
+-- MAGIC missing_summary = answered_df.select(
+-- MAGIC     *[
+-- MAGIC         F.sum(
+-- MAGIC             F.when(
+-- MAGIC                 F.col(c).isNull()
+-- MAGIC                 | (F.trim(F.col(c)) == "")
+-- MAGIC                 | (F.trim(F.col(c)) == "\\N"),
+-- MAGIC                 1
+-- MAGIC             ).otherwise(0)
+-- MAGIC         ).alias(c)
+-- MAGIC         for c in columns_to_check
+-- MAGIC     ]
+-- MAGIC )
+-- MAGIC
+-- MAGIC display(missing_summary)
+
+-- COMMAND ----------
+
+-- MAGIC %md
+-- MAGIC ## 9. Detailed Duplicate QA Analysis
+-- MAGIC
+-- MAGIC Repeated question-answer pairs are examined using document, URL, topic, question-type, and source metadata. This helps distinguish same-document duplication from cross-document duplication.
+-- MAGIC
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC from pyspark.sql import functions as F
+-- MAGIC
+-- MAGIC duplicate_qa_analysis_df = (
+-- MAGIC     answered_df
+-- MAGIC     .groupBy("question", "answer")
+-- MAGIC     .agg(
+-- MAGIC         F.count("*").alias("row_count"),
+-- MAGIC         F.countDistinct("document_id").alias("document_count"),
+-- MAGIC         F.countDistinct("document_url").alias("url_count"),
+-- MAGIC         F.countDistinct("question_focus").alias("topic_count"),
+-- MAGIC         F.countDistinct("question_type").alias("question_type_count"),
+-- MAGIC         F.countDistinct("document_source").alias("source_count")
+-- MAGIC     )
+-- MAGIC     .filter(F.col("row_count") > 1)
+-- MAGIC     .orderBy(F.desc("row_count"))
+-- MAGIC )
+-- MAGIC
+-- MAGIC display(duplicate_qa_analysis_df)
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC duplicate_qa_classified_df = (
+-- MAGIC     duplicate_qa_analysis_df
+-- MAGIC     .withColumn(
+-- MAGIC         "duplicate_type",
+-- MAGIC         F.when(
+-- MAGIC             (F.col("document_count") == 1)
+-- MAGIC             & (F.col("url_count") == 1)
+-- MAGIC             & (F.col("topic_count") == 1)
+-- MAGIC             & (F.col("question_type_count") == 1)
+-- MAGIC             & (F.col("source_count") == 1),
+-- MAGIC             "same_document_duplicate"
+-- MAGIC         )
+-- MAGIC         .otherwise("cross_document_duplicate")
+-- MAGIC     )
+-- MAGIC )
+-- MAGIC
+-- MAGIC display(duplicate_qa_classified_df)
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC display(
+-- MAGIC     duplicate_qa_classified_df
+-- MAGIC     .groupBy("duplicate_type")
+-- MAGIC     .count()
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC cross_document_duplicates_df = (
+-- MAGIC     duplicate_qa_classified_df
+-- MAGIC     .filter(F.col("duplicate_type") == "cross_document_duplicate")
+-- MAGIC     .select("question", "answer")
+-- MAGIC )
+-- MAGIC
+-- MAGIC cross_document_details_df = (
+-- MAGIC     answered_df
+-- MAGIC     .join(
+-- MAGIC         cross_document_duplicates_df,
+-- MAGIC         on=["question", "answer"],
+-- MAGIC         how="inner"
+-- MAGIC     )
+-- MAGIC     .select(
+-- MAGIC         "document_id",
+-- MAGIC         "question_id",
+-- MAGIC         "document_source",
+-- MAGIC         "document_url",
+-- MAGIC         "category",
+-- MAGIC         "question_focus",
+-- MAGIC         "question_type",
+-- MAGIC         "question",
+-- MAGIC         "answer"
+-- MAGIC     )
+-- MAGIC     .orderBy(
+-- MAGIC         "question",
+-- MAGIC         "document_id",
+-- MAGIC         "question_id"
+-- MAGIC     )
+-- MAGIC )
+-- MAGIC
+-- MAGIC display(cross_document_details_df)
+
+-- COMMAND ----------
+
+-- MAGIC %md
+-- MAGIC ## 10. Initial Malformed-Question Exploration
+-- MAGIC
+-- MAGIC The first detector intentionally casts a wide net. Most suspicious questions turn out to have only duplicated punctuation, while a small number genuinely lack the medical subject.
+-- MAGIC
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC from pyspark.sql import functions as F
+-- MAGIC
+-- MAGIC malformed_question_candidates_df = (
+-- MAGIC     answered_df
+-- MAGIC     .filter(
+-- MAGIC         (F.length(F.trim(F.col("question"))) < 15)
+-- MAGIC         | F.col("question").rlike(r"\?\s*\?")
+-- MAGIC         | F.col("question").rlike(r"\(\s*are\s*\)\s*\?")
+-- MAGIC     )
+-- MAGIC     .select(
+-- MAGIC         "document_source",
+-- MAGIC         "question_focus",
+-- MAGIC         "question_type",
+-- MAGIC         "question",
+-- MAGIC         "answer"
+-- MAGIC     )
+-- MAGIC )
+-- MAGIC
+-- MAGIC display(malformed_question_candidates_df)
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC question_issue_summary_df = (
+-- MAGIC     malformed_question_candidates_df
+-- MAGIC     .withColumn(
+-- MAGIC         "question_issue",
+-- MAGIC         F.when(
+-- MAGIC             F.col("question").rlike(r"\?\s*\?$"),
+-- MAGIC             "DUPLICATE_QUESTION_MARK"
+-- MAGIC         ).when(
+-- MAGIC             F.col("question").rlike(r"(?i)^\s*what is \(are\)\s*\?\s*$"),
+-- MAGIC             "MISSING_QUESTION_SUBJECT"
+-- MAGIC         ).otherwise(
+-- MAGIC             "OTHER"
+-- MAGIC         )
+-- MAGIC     )
+-- MAGIC )
+-- MAGIC
+-- MAGIC display(
+-- MAGIC     question_issue_summary_df
+-- MAGIC     .groupBy("question_issue")
+-- MAGIC     .count()
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC display(
+-- MAGIC     question_issue_summary_df
+-- MAGIC     .filter(F.col("question_issue") == "MISSING_QUESTION_SUBJECT")
+-- MAGIC     .select(
+-- MAGIC         "document_source",
+-- MAGIC         "question_focus",
+-- MAGIC         "question_type",
+-- MAGIC         "question",
+-- MAGIC         "answer"
+-- MAGIC     )
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %md
+-- MAGIC ## 11. Explore Potentially Low-Quality Answers
+-- MAGIC
+-- MAGIC Simple features such as answer length, word count, trailing punctuation, and repeated short values are useful for **finding candidates to inspect**. They are not sufficient by themselves to decide whether an answer is valid.
+-- MAGIC
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC potential_low_quality_answers_df = (
+-- MAGIC     answer_length_df
+-- MAGIC     .filter(F.col("answer_length") <= 50)
+-- MAGIC     .select(
+-- MAGIC         "document_source",
+-- MAGIC         "question_focus",
+-- MAGIC         "question_type",
+-- MAGIC         "question",
+-- MAGIC         "answer",
+-- MAGIC         "answer_length"
+-- MAGIC     )
+-- MAGIC     .orderBy("answer_length")
+-- MAGIC )
+-- MAGIC
+-- MAGIC display(potential_low_quality_answers_df)
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC def normalize_text(column):
+-- MAGIC     return F.trim(
+-- MAGIC         F.regexp_replace(
+-- MAGIC             F.lower(
+-- MAGIC                 F.regexp_replace(
+-- MAGIC                     F.col(column),
+-- MAGIC                     r"[^a-zA-Z0-9 ]",
+-- MAGIC                     ""
+-- MAGIC                 )
+-- MAGIC             ),
+-- MAGIC             r"\s+",
+-- MAGIC             " "
+-- MAGIC         )
+-- MAGIC     )
+-- MAGIC
+-- MAGIC
+-- MAGIC question_answer_comparison_df = (
+-- MAGIC     answered_df
+-- MAGIC     .withColumn(
+-- MAGIC         "normalized_question",
+-- MAGIC         normalize_text("question")
+-- MAGIC     )
+-- MAGIC     .withColumn(
+-- MAGIC         "normalized_answer",
+-- MAGIC         normalize_text("answer")
+-- MAGIC     )
+-- MAGIC )
+-- MAGIC
+-- MAGIC same_question_answer_df = (
+-- MAGIC     question_answer_comparison_df
+-- MAGIC     .filter(
+-- MAGIC         F.col("normalized_question")
+-- MAGIC         == F.col("normalized_answer")
+-- MAGIC     )
+-- MAGIC )
+-- MAGIC
+-- MAGIC print(
+-- MAGIC     "Rows where answer equals question:",
+-- MAGIC     same_question_answer_df.count()
+-- MAGIC )
+-- MAGIC
+-- MAGIC display(
+-- MAGIC     same_question_answer_df.select(
+-- MAGIC         "document_source",
+-- MAGIC         "question_focus",
+-- MAGIC         "question_type",
+-- MAGIC         "question",
+-- MAGIC         "answer"
+-- MAGIC     )
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC from pyspark.sql import functions as F
+-- MAGIC
+-- MAGIC answer_quality_candidates_df = (
+-- MAGIC     answered_df
+-- MAGIC     .withColumn(
+-- MAGIC         "normalized_answer",
+-- MAGIC         normalize_text("answer")
+-- MAGIC     )
+-- MAGIC     .withColumn(
+-- MAGIC         "answer_length",
+-- MAGIC         F.length(F.trim(F.col("answer")))
+-- MAGIC     )
+-- MAGIC     .withColumn(
+-- MAGIC         "word_count",
+-- MAGIC         F.size(
+-- MAGIC             F.split(
+-- MAGIC                 F.trim(F.col("answer")),
+-- MAGIC                 r"\s+"
+-- MAGIC             )
+-- MAGIC         )
+-- MAGIC     )
+-- MAGIC     .withColumn(
+-- MAGIC         "ends_with_question_mark",
+-- MAGIC         F.trim(F.col("answer")).rlike(r"\?$")
+-- MAGIC     )
+-- MAGIC     .withColumn(
+-- MAGIC         "ends_with_colon",
+-- MAGIC         F.trim(F.col("answer")).rlike(r":$")
+-- MAGIC     )
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC answer_value_summary_df = (
+-- MAGIC     answer_quality_candidates_df
+-- MAGIC     .groupBy("normalized_answer")
+-- MAGIC     .agg(
+-- MAGIC         F.first("answer").alias("example_answer"),
+-- MAGIC         F.count("*").alias("row_count"),
+-- MAGIC         F.countDistinct("question").alias("distinct_questions"),
+-- MAGIC         F.countDistinct("question_focus").alias("distinct_topics"),
+-- MAGIC         F.countDistinct("document_source").alias("distinct_sources"),
+-- MAGIC         F.min("answer_length").alias("answer_length"),
+-- MAGIC         F.min("word_count").alias("word_count"),
+-- MAGIC         F.max(
+-- MAGIC             F.col("ends_with_question_mark").cast("int")
+-- MAGIC         ).alias("ends_with_question_mark"),
+-- MAGIC         F.max(
+-- MAGIC             F.col("ends_with_colon").cast("int")
+-- MAGIC         ).alias("ends_with_colon")
+-- MAGIC     )
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC suspicious_answer_values_df = (
+-- MAGIC     answer_value_summary_df
+-- MAGIC     .filter(
+-- MAGIC         (F.col("word_count") <= 8)
+-- MAGIC         | (F.col("ends_with_question_mark") == 1)
+-- MAGIC         | (F.col("ends_with_colon") == 1)
+-- MAGIC         | (
+-- MAGIC             (F.col("row_count") > 1)
+-- MAGIC             & (F.col("distinct_questions") > 1)
+-- MAGIC             & (F.col("answer_length") <= 150)
+-- MAGIC         )
+-- MAGIC     )
+-- MAGIC     .orderBy(
+-- MAGIC         F.desc("row_count"),
+-- MAGIC         "answer_length"
+-- MAGIC     )
+-- MAGIC )
+-- MAGIC
+-- MAGIC display(suspicious_answer_values_df)
+
+-- COMMAND ----------
+
+-- MAGIC %md
+-- MAGIC ### 11.1 Exploratory Rule-Based Quality Checks — Superseded
+-- MAGIC
+-- MAGIC These hardcoded checks were an intermediate experiment. They are kept for transparency because they demonstrate why purely lexical rules do not scale well to semantic answer quality.
+-- MAGIC
+-- MAGIC The **final quality gate is the LLM-based classifier** in the next section.
+-- MAGIC
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC from pyspark.sql import functions as F
+-- MAGIC
+-- MAGIC NON_INFORMATIVE_ANSWERS = [
+-- MAGIC     "topics",
+-- MAGIC     "general guidelines for safe seafood consumption"
+-- MAGIC ]
+-- MAGIC
+-- MAGIC answer_quality_df = (
+-- MAGIC     answered_df
+-- MAGIC     .withColumn(
+-- MAGIC         "normalized_question",
+-- MAGIC         normalize_text("question")
+-- MAGIC     )
+-- MAGIC     .withColumn(
+-- MAGIC         "normalized_answer",
+-- MAGIC         normalize_text("answer")
+-- MAGIC     )
+-- MAGIC     .withColumn(
+-- MAGIC         "answer_quality_issue",
+-- MAGIC
+-- MAGIC         # Answer is just the original question again
+-- MAGIC         F.when(
+-- MAGIC             F.col("normalized_question") == F.col("normalized_answer"),
+-- MAGIC             "answer_repeats_question"
+-- MAGIC         )
+-- MAGIC
+-- MAGIC         # Answer is just another short question
+-- MAGIC         .when(
+-- MAGIC             (F.length(F.trim(F.col("answer"))) <= 100)
+-- MAGIC             & F.trim(F.col("answer")).rlike(r"\?$"),
+-- MAGIC             "answer_is_question"
+-- MAGIC         )
+-- MAGIC
+-- MAGIC         # Scraped FAQ/navigation headings
+-- MAGIC         .when(
+-- MAGIC             F.col("normalized_answer").startswith(
+-- MAGIC                 "frequently asked questions"
+-- MAGIC             )
+-- MAGIC             | F.col("normalized_answer").startswith(
+-- MAGIC                 "frequently asked queestions"
+-- MAGIC             ),
+-- MAGIC             "navigation_or_heading_answer"
+-- MAGIC         )
+-- MAGIC
+-- MAGIC         # Other confirmed useless answers found during EDA
+-- MAGIC         .when(
+-- MAGIC             F.col("normalized_answer").isin(
+-- MAGIC                 NON_INFORMATIVE_ANSWERS
+-- MAGIC             ),
+-- MAGIC             "non_informative_answer"
+-- MAGIC         )
+-- MAGIC     )
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC display(
+-- MAGIC     answer_quality_df
+-- MAGIC     .filter(F.col("answer_quality_issue").isNotNull())
+-- MAGIC     .groupBy("answer_quality_issue")
+-- MAGIC     .count()
+-- MAGIC     .orderBy(F.desc("count"))
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC display(
+-- MAGIC     answer_quality_df
+-- MAGIC     .filter(F.col("answer_quality_issue").isNotNull())
+-- MAGIC     .select(
+-- MAGIC         "document_source",
+-- MAGIC         "question_focus",
+-- MAGIC         "question_type",
+-- MAGIC         "question",
+-- MAGIC         "answer",
+-- MAGIC         "answer_quality_issue"
+-- MAGIC     )
+-- MAGIC     .orderBy(
+-- MAGIC         "answer_quality_issue",
+-- MAGIC         "document_source"
+-- MAGIC     )
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC quality_test_df = (
+-- MAGIC     answered_df
+-- MAGIC     .filter(
+-- MAGIC         (F.length(F.trim(F.col("answer"))) <= 100)
+-- MAGIC         | (F.col("document_source") == "CDC")
+-- MAGIC     )
+-- MAGIC     .select(
+-- MAGIC         "document_source",
+-- MAGIC         "question_focus",
+-- MAGIC         "question_type",
+-- MAGIC         "question",
+-- MAGIC         "answer"
+-- MAGIC     )
+-- MAGIC     .limit(100)
+-- MAGIC )
+-- MAGIC
+-- MAGIC display(quality_test_df)
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC suspicious_candidates_df = (
+-- MAGIC     answer_quality_candidates_df
+-- MAGIC     .filter(
+-- MAGIC         (F.col("word_count") <= 12)
+-- MAGIC         | F.col("ends_with_question_mark")
+-- MAGIC         | F.col("ends_with_colon")
+-- MAGIC     )
+-- MAGIC     .select(
+-- MAGIC         "document_source",
+-- MAGIC         "question_focus",
+-- MAGIC         "question_type",
+-- MAGIC         "question",
+-- MAGIC         "answer"
+-- MAGIC     )
+-- MAGIC     .dropDuplicates(["question", "answer"])
+-- MAGIC     .orderBy(F.rand(seed=42))
+-- MAGIC     .limit(30)
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC normal_candidates_df = (
+-- MAGIC     answer_quality_candidates_df
+-- MAGIC     .filter(
+-- MAGIC         (F.col("word_count") > 12)
+-- MAGIC         & (~F.col("ends_with_question_mark"))
+-- MAGIC         & (~F.col("ends_with_colon"))
+-- MAGIC     )
+-- MAGIC     .select(
+-- MAGIC         "document_source",
+-- MAGIC         "question_focus",
+-- MAGIC         "question_type",
+-- MAGIC         "question",
+-- MAGIC         "answer"
+-- MAGIC     )
+-- MAGIC     .dropDuplicates(["question", "answer"])
+-- MAGIC     .orderBy(F.rand(seed=42))
+-- MAGIC     .limit(20)
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC quality_evaluation_df = (
+-- MAGIC     suspicious_candidates_df
+-- MAGIC     .unionByName(normal_candidates_df)
+-- MAGIC     .orderBy(F.rand(seed=42))
+-- MAGIC )
+-- MAGIC
+-- MAGIC display(quality_evaluation_df)
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC from pyspark.sql import Window
+-- MAGIC from pyspark.sql import functions as F
+-- MAGIC
+-- MAGIC evaluation_window = Window.orderBy(
+-- MAGIC     F.monotonically_increasing_id()
+-- MAGIC )
+-- MAGIC
+-- MAGIC labeled_evaluation_df = (
+-- MAGIC     quality_evaluation_df
+-- MAGIC     .withColumn(
+-- MAGIC         "evaluation_id",
+-- MAGIC         F.row_number().over(evaluation_window)
+-- MAGIC     )
+-- MAGIC )
+-- MAGIC
+-- MAGIC display(
+-- MAGIC     labeled_evaluation_df.select(
+-- MAGIC         "evaluation_id",
+-- MAGIC         "document_source",
+-- MAGIC         "question_focus",
+-- MAGIC         "question_type",
+-- MAGIC         "question",
+-- MAGIC         "answer"
+-- MAGIC     )
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC ground_truth_labels = [
+-- MAGIC     (1,  "IRRELEVANT"),
+-- MAGIC     (2,  "VALID"),
+-- MAGIC     (3,  "FRAGMENT_OR_HEADING"),
+-- MAGIC     (7,  "VALID"),
+-- MAGIC     (8,  "VALID"),
+-- MAGIC     (10, "VALID"),
+-- MAGIC     (12, "VALID"),
+-- MAGIC     (13, "NON_INFORMATIVE"),
+-- MAGIC     (18, "VALID"),
+-- MAGIC     (22, "QUESTION_AS_ANSWER"),
+-- MAGIC     (23, "IRRELEVANT"),
+-- MAGIC     (24, "VALID"),
+-- MAGIC     (27, "VALID"),
+-- MAGIC     (28, "IRRELEVANT"),
+-- MAGIC     (29, "VALID"),
+-- MAGIC     (31, "VALID"),
+-- MAGIC     (33, "VALID"),
+-- MAGIC     (34, "NON_INFORMATIVE"),
+-- MAGIC     (35, "VALID"),
+-- MAGIC     (36, "VALID"),
+-- MAGIC     (37, "VALID"),
+-- MAGIC     (38, "VALID"),
+-- MAGIC     (42, "VALID"),
+-- MAGIC     (44, "VALID"),
+-- MAGIC     (47, "VALID"),
+-- MAGIC     (49, "VALID")
+-- MAGIC ]
+-- MAGIC
+-- MAGIC ground_truth_df = spark.createDataFrame(
+-- MAGIC     ground_truth_labels,
+-- MAGIC     ["evaluation_id", "expected_label"]
+-- MAGIC )
+-- MAGIC
+-- MAGIC
+-- MAGIC quality_ground_truth_df = (
+-- MAGIC     labeled_evaluation_df
+-- MAGIC     .join(
+-- MAGIC         ground_truth_df,
+-- MAGIC         on="evaluation_id",
+-- MAGIC         how="inner"
+-- MAGIC     )
+-- MAGIC )
+-- MAGIC
+-- MAGIC display(
+-- MAGIC     quality_ground_truth_df.select(
+-- MAGIC         "evaluation_id",
+-- MAGIC         "document_source",
+-- MAGIC         "question",
+-- MAGIC         "answer",
+-- MAGIC         "expected_label"
+-- MAGIC     )
+-- MAGIC     .orderBy("evaluation_id")
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %md
+-- MAGIC ## 12. Prototype the LLM Answer-Quality Classifier
+-- MAGIC
+-- MAGIC The classifier answers one question only:
+-- MAGIC
+-- MAGIC > Does the answer meaningfully respond to the question?
+-- MAGIC
+-- MAGIC It does **not** attempt to verify medical factual correctness.
+-- MAGIC
+-- MAGIC Invalid answers are categorized as:
+-- MAGIC - `QUESTION_AS_ANSWER`
+-- MAGIC - `NON_INFORMATIVE`
+-- MAGIC - `IRRELEVANT`
+-- MAGIC - `FRAGMENT_OR_HEADING`
+-- MAGIC
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC from databricks.sdk import WorkspaceClient
+-- MAGIC
+-- MAGIC w = WorkspaceClient()
+-- MAGIC
+-- MAGIC endpoints = list(w.serving_endpoints.list())
+-- MAGIC
+-- MAGIC for endpoint in endpoints:
+-- MAGIC     print(endpoint.name)
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC test_llm_df = spark.sql("""
+-- MAGIC     SELECT ai_query(
+-- MAGIC         'databricks-gpt-oss-20b',
+-- MAGIC         'Reply only with the word OK.'
+-- MAGIC     ) AS response
+-- MAGIC """)
+-- MAGIC
+-- MAGIC display(test_llm_df)
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC quality_prompt = """
+-- MAGIC You are a data-quality classifier for a medical question-answer dataset.
+-- MAGIC
+-- MAGIC Your task is NOT to verify whether the medical information is factually correct.
+-- MAGIC Your task is to determine whether the provided ANSWER meaningfully responds
+-- MAGIC to the provided QUESTION.
+-- MAGIC
+-- MAGIC First classify the answer's quality_status as exactly one of:
+-- MAGIC
+-- MAGIC VALID
+-- MAGIC - The answer provides meaningful information relevant to and responsive to the question.
+-- MAGIC - Short answers can still be VALID.
+-- MAGIC - An answer can begin with a heading or a restatement of the question and still
+-- MAGIC   be VALID if useful answer content follows.
+-- MAGIC
+-- MAGIC INVALID
+-- MAGIC - The answer does not meaningfully answer the question.
+-- MAGIC
+-- MAGIC If quality_status is INVALID, classify issue_type as exactly one of:
+-- MAGIC
+-- MAGIC QUESTION_AS_ANSWER
+-- MAGIC - The answer only repeats or rephrases the question as another question.
+-- MAGIC - There is no substantive answer after it.
+-- MAGIC
+-- MAGIC NON_INFORMATIVE
+-- MAGIC - The answer is related to the topic but provides essentially no useful answer.
+-- MAGIC - For example, it only tells the reader to consult another resource.
+-- MAGIC
+-- MAGIC IRRELEVANT
+-- MAGIC - The answer contains information, but it does not meaningfully answer
+-- MAGIC   the specific question being asked.
+-- MAGIC
+-- MAGIC FRAGMENT_OR_HEADING
+-- MAGIC - The answer consists only of a webpage heading, navigation text,
+-- MAGIC   label, or incomplete fragment with no substantive answer.
+-- MAGIC
+-- MAGIC If quality_status is VALID, issue_type must be null.
+-- MAGIC
+-- MAGIC Important:
+-- MAGIC - Do not reject an answer merely because it is short.
+-- MAGIC - Do not reject an answer merely because it contains a question.
+-- MAGIC - If useful answer content follows a question-like heading, it can still be VALID.
+-- MAGIC - An answer can still be VALID if it states that the requested information
+-- MAGIC   is unknown, unavailable, uncertain, or has not yet been established,
+-- MAGIC   as long as that statement directly responds to the question.
+-- MAGIC - Information that is merely related to the same topic is not enough.
+-- MAGIC   The answer must meaningfully address what the question specifically asks.
+-- MAGIC - For questions asking what something is, information only about risk factors,
+-- MAGIC   treatment, prevention, or management is not sufficient unless it also
+-- MAGIC   meaningfully explains the thing being asked about.
+-- MAGIC - Focus on whether the answer meaningfully responds to the question.
+-- MAGIC - Do not judge whether the medical claims are factually correct.
+-- MAGIC
+-- MAGIC Return the result as a JSON object with exactly these three fields:
+-- MAGIC
+-- MAGIC {
+-- MAGIC   "quality_status": "VALID or INVALID",
+-- MAGIC   "issue_type": null,
+-- MAGIC   "reason": "A short explanation for the classification"
+-- MAGIC }
+-- MAGIC
+-- MAGIC For INVALID answers, issue_type must contain one of:
+-- MAGIC QUESTION_AS_ANSWER, NON_INFORMATIVE, IRRELEVANT, FRAGMENT_OR_HEADING.
+-- MAGIC
+-- MAGIC For VALID answers, issue_type must be null.
+-- MAGIC
+-- MAGIC Return JSON only. Do not include markdown or any text outside the JSON object.
+-- MAGIC
+-- MAGIC QUESTION:
+-- MAGIC %s
+-- MAGIC
+-- MAGIC ANSWER:
+-- MAGIC %s
+-- MAGIC """
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC from pyspark.sql import functions as F
+-- MAGIC
+-- MAGIC classifier_input_df = (
+-- MAGIC     quality_ground_truth_df
+-- MAGIC     .withColumn(
+-- MAGIC         "classifier_prompt",
+-- MAGIC         F.format_string(
+-- MAGIC             quality_prompt,
+-- MAGIC             F.col("question"),
+-- MAGIC             F.col("answer")
+-- MAGIC         )
+-- MAGIC     )
+-- MAGIC )
+-- MAGIC
+-- MAGIC display(
+-- MAGIC     classifier_input_df.select(
+-- MAGIC         "evaluation_id",
+-- MAGIC         "classifier_prompt"
+-- MAGIC     )
+-- MAGIC     .orderBy("evaluation_id")
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC quality_predictions_raw_df = (
+-- MAGIC     classifier_input_df
+-- MAGIC     .selectExpr(
+-- MAGIC         "*",
+-- MAGIC         """
+-- MAGIC         ai_query(
+-- MAGIC             'databricks-gpt-oss-20b',
+-- MAGIC             classifier_prompt,
+-- MAGIC             modelParameters => named_struct(
+-- MAGIC                 'temperature', 0.0,
+-- MAGIC                 'max_tokens', 500,
+-- MAGIC                 'reasoning_effort', 'low'
+-- MAGIC             ),
+-- MAGIC             responseFormat => '{"type":"json_object"}'
+-- MAGIC         ) AS classification
+-- MAGIC         """
+-- MAGIC     )
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC prediction_rows = (
+-- MAGIC     quality_predictions_raw_df
+-- MAGIC     .select(
+-- MAGIC         "evaluation_id",
+-- MAGIC         "question",
+-- MAGIC         "answer",
+-- MAGIC         "expected_label",
+-- MAGIC         "classification"
+-- MAGIC     )
+-- MAGIC     .collect()
+-- MAGIC )
+-- MAGIC
+-- MAGIC quality_predictions_materialized_df = spark.createDataFrame(
+-- MAGIC     prediction_rows
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC display(
+-- MAGIC     quality_predictions_materialized_df
+-- MAGIC     .agg(
+-- MAGIC         F.count("*").alias("total"),
+-- MAGIC         F.sum(
+-- MAGIC             F.when(
+-- MAGIC                 F.col("classification").isNull()
+-- MAGIC                 | (F.trim(F.col("classification")) == ""),
+-- MAGIC                 1
+-- MAGIC             ).otherwise(0)
+-- MAGIC         ).alias("empty_responses")
+-- MAGIC     )
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC from pyspark.sql.types import StructType, StructField, StringType
+-- MAGIC
+-- MAGIC classification_schema = StructType([
+-- MAGIC     StructField("quality_status", StringType(), True),
+-- MAGIC     StructField("issue_type", StringType(), True),
+-- MAGIC     StructField("reason", StringType(), True)
+-- MAGIC ])
+-- MAGIC
+-- MAGIC quality_predictions_df = (
+-- MAGIC     quality_predictions_materialized_df
+-- MAGIC     .withColumn(
+-- MAGIC         "parsed_classification",
+-- MAGIC         F.from_json(
+-- MAGIC             F.col("classification"),
+-- MAGIC             classification_schema
+-- MAGIC         )
+-- MAGIC     )
+-- MAGIC     .withColumn(
+-- MAGIC         "predicted_status",
+-- MAGIC         F.upper(
+-- MAGIC             F.trim(
+-- MAGIC                 F.col("parsed_classification.quality_status")
+-- MAGIC             )
+-- MAGIC         )
+-- MAGIC     )
+-- MAGIC     .withColumn(
+-- MAGIC         "predicted_issue_type",
+-- MAGIC         F.upper(
+-- MAGIC             F.trim(
+-- MAGIC                 F.col("parsed_classification.issue_type")
+-- MAGIC             )
+-- MAGIC         )
+-- MAGIC     )
+-- MAGIC     .withColumn(
+-- MAGIC         "prediction_reason",
+-- MAGIC         F.col("parsed_classification.reason")
+-- MAGIC     )
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC display(
+-- MAGIC     quality_predictions_df.select(
+-- MAGIC         "evaluation_id",
+-- MAGIC         "expected_label",
+-- MAGIC         "predicted_status",
+-- MAGIC         "predicted_issue_type",
+-- MAGIC         "prediction_reason"
+-- MAGIC     )
+-- MAGIC     .orderBy("evaluation_id")
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC quality_predictions_df = (
+-- MAGIC     quality_predictions_df
+-- MAGIC     .withColumn(
+-- MAGIC         "expected_status",
+-- MAGIC         F.when(
+-- MAGIC             F.col("expected_label") == "VALID",
+-- MAGIC             "VALID"
+-- MAGIC         ).otherwise("INVALID")
+-- MAGIC     )
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC classifier_evaluation_df = (
+-- MAGIC     quality_predictions_df
+-- MAGIC     .withColumn(
+-- MAGIC         "is_correct",
+-- MAGIC         F.col("expected_status")
+-- MAGIC         == F.col("predicted_status")
+-- MAGIC     )
+-- MAGIC )
+-- MAGIC
+-- MAGIC display(
+-- MAGIC     classifier_evaluation_df.select(
+-- MAGIC         "evaluation_id",
+-- MAGIC         "expected_label",
+-- MAGIC         "expected_status",
+-- MAGIC         "predicted_status",
+-- MAGIC         "predicted_issue_type",
+-- MAGIC         "is_correct",
+-- MAGIC         "prediction_reason"
+-- MAGIC     )
+-- MAGIC     .orderBy("evaluation_id")
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC display(
+-- MAGIC     classifier_evaluation_df
+-- MAGIC     .agg(
+-- MAGIC         F.count("*").alias("total_records"),
+-- MAGIC         F.sum(
+-- MAGIC             F.col("is_correct").cast("int")
+-- MAGIC         ).alias("correct_predictions"),
+-- MAGIC         F.round(
+-- MAGIC             F.avg(
+-- MAGIC                 F.col("is_correct").cast("double")
+-- MAGIC             ) * 100,
+-- MAGIC             2
+-- MAGIC         ).alias("accuracy_percentage")
+-- MAGIC     )
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC display(
+-- MAGIC     classifier_evaluation_df
+-- MAGIC     .filter(~F.col("is_correct"))
+-- MAGIC     .select(
+-- MAGIC         "evaluation_id",
+-- MAGIC         "question",
+-- MAGIC         "answer",
+-- MAGIC         "expected_status",
+-- MAGIC         "predicted_status",
+-- MAGIC         "predicted_issue_type",
+-- MAGIC         "prediction_reason"
+-- MAGIC     )
+-- MAGIC     .orderBy("evaluation_id")
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %md
+-- MAGIC ## 13. Extended Answer-Quality Classifier Evaluation
+-- MAGIC
+-- MAGIC The initial sample was too small to be strong evidence. This section builds a larger independent sample, prevents overlap with previously reviewed rows, applies human labels, runs the classifier, and evaluates its binary VALID/INVALID performance.
+-- MAGIC
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC from pyspark.sql import functions as F
+-- MAGIC
+-- MAGIC def evaluation_key(df):
+-- MAGIC     return df.withColumn(
+-- MAGIC         "qa_key",
+-- MAGIC         F.sha2(
+-- MAGIC             F.concat_ws(
+-- MAGIC                 "||",
+-- MAGIC                 F.lower(F.trim(F.regexp_replace(F.col("question"), r"\s+", " "))),
+-- MAGIC                 F.lower(F.trim(F.regexp_replace(F.col("answer"), r"\s+", " ")))
+-- MAGIC             ),
+-- MAGIC             256
+-- MAGIC         )
+-- MAGIC     )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC reviewed_keys_df = (
+-- MAGIC     evaluation_key(labeled_evaluation_df)
+-- MAGIC     .select("qa_key")
+-- MAGIC     .dropDuplicates()
+-- MAGIC )
+-- MAGIC
+-- MAGIC new_candidate_pool_df = (
+-- MAGIC     evaluation_key(answer_quality_candidates_df)
+-- MAGIC     .join(
+-- MAGIC         reviewed_keys_df,
+-- MAGIC         on="qa_key",
+-- MAGIC         how="left_anti"
+-- MAGIC     )
+-- MAGIC     .drop("qa_key")
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC overlap_count = (
+-- MAGIC     evaluation_key(new_candidate_pool_df)
+-- MAGIC     .join(
+-- MAGIC         reviewed_keys_df,
+-- MAGIC         on="qa_key",
+-- MAGIC         how="inner"
+-- MAGIC     )
+-- MAGIC     .count()
+-- MAGIC )
+-- MAGIC
+-- MAGIC print("Overlap with original evaluation set:", overlap_count)
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC suspicious_pool_df = (
+-- MAGIC     new_candidate_pool_df
+-- MAGIC     .filter(
+-- MAGIC         (F.col("word_count") <= 15)
+-- MAGIC         | F.col("ends_with_question_mark")
+-- MAGIC         | F.col("ends_with_colon")
+-- MAGIC     )
+-- MAGIC )
+-- MAGIC
+-- MAGIC suspicious_window = (
+-- MAGIC     Window
+-- MAGIC     .partitionBy(
+-- MAGIC         "document_source",
+-- MAGIC         "question_type"
+-- MAGIC     )
+-- MAGIC     .orderBy(F.rand(seed=42))
+-- MAGIC )
+-- MAGIC
+-- MAGIC suspicious_sample_df = (
+-- MAGIC     suspicious_pool_df
+-- MAGIC     .withColumn(
+-- MAGIC         "sample_rank",
+-- MAGIC         F.row_number().over(suspicious_window)
+-- MAGIC     )
+-- MAGIC     .filter(F.col("sample_rank") <= 5)
+-- MAGIC     .drop("sample_rank")
+-- MAGIC     .orderBy(F.rand(seed=42))
+-- MAGIC     .limit(70)
+-- MAGIC     .withColumn("sample_group", F.lit("SUSPICIOUS"))
+-- MAGIC )
+-- MAGIC
+-- MAGIC normal_pool_df = (
+-- MAGIC     new_candidate_pool_df
+-- MAGIC     .filter(
+-- MAGIC         (F.col("word_count") > 15)
+-- MAGIC         & (~F.col("ends_with_question_mark"))
+-- MAGIC         & (~F.col("ends_with_colon"))
+-- MAGIC     )
+-- MAGIC )
+-- MAGIC
+-- MAGIC normal_window = (
+-- MAGIC     Window
+-- MAGIC     .partitionBy(
+-- MAGIC         "document_source",
+-- MAGIC         "question_type"
+-- MAGIC     )
+-- MAGIC     .orderBy(F.rand(seed=42))
+-- MAGIC )
+-- MAGIC
+-- MAGIC normal_sample_df = (
+-- MAGIC     normal_pool_df
+-- MAGIC     .withColumn(
+-- MAGIC         "sample_rank",
+-- MAGIC         F.row_number().over(normal_window)
+-- MAGIC     )
+-- MAGIC     .filter(F.col("sample_rank") <= 3)
+-- MAGIC     .drop("sample_rank")
+-- MAGIC     .orderBy(F.rand(seed=42))
+-- MAGIC     .limit(50)
+-- MAGIC     .withColumn("sample_group", F.lit("NORMAL"))
+-- MAGIC )
+-- MAGIC
+-- MAGIC extended_evaluation_df = (
+-- MAGIC     suspicious_sample_df
+-- MAGIC     .unionByName(normal_sample_df)
+-- MAGIC     .dropDuplicates(["question", "answer"])
+-- MAGIC )
+-- MAGIC
+-- MAGIC
+-- MAGIC extended_evaluation_df = (
+-- MAGIC     extended_evaluation_df
+-- MAGIC     .withColumn(
+-- MAGIC         "evaluation_id",
+-- MAGIC         F.sha2(
+-- MAGIC             F.concat_ws(
+-- MAGIC                 "||",
+-- MAGIC                 F.col("question"),
+-- MAGIC                 F.col("answer")
+-- MAGIC             ),
+-- MAGIC             256
+-- MAGIC         )
+-- MAGIC     )
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC display(
+-- MAGIC     extended_evaluation_df
+-- MAGIC     .groupBy("sample_group")
+-- MAGIC     .count()
+-- MAGIC )
+-- MAGIC
+-- MAGIC print(
+-- MAGIC     "Total extended evaluation rows:",
+-- MAGIC     extended_evaluation_df.count()
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC display(
+-- MAGIC     extended_evaluation_df
+-- MAGIC     .groupBy(
+-- MAGIC         "sample_group",
+-- MAGIC         "document_source"
+-- MAGIC     )
+-- MAGIC     .count()
+-- MAGIC     .orderBy(
+-- MAGIC         "sample_group",
+-- MAGIC         F.desc("count")
+-- MAGIC     )
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC display(
+-- MAGIC     extended_evaluation_df.select(
+-- MAGIC         "evaluation_id",
+-- MAGIC         "sample_group",
+-- MAGIC         "document_source",
+-- MAGIC         "question_focus",
+-- MAGIC         "question_type",
+-- MAGIC         "question",
+-- MAGIC         "answer"
+-- MAGIC     )
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- %python
+
+-- extended_overlap = (
+--     evaluation_key(extended_evaluation_df)
+--     .join(
+--         reviewed_keys_df,
+--         on="qa_key",
+--         how="inner"
+--     )
+--     .count()
+-- )
+
+-- print("Overlap in FINAL extended sample:", extended_overlap)
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC display(
+-- MAGIC     extended_evaluation_df.select(
+-- MAGIC         "evaluation_id",
+-- MAGIC         "sample_group",
+-- MAGIC         "document_source",
+-- MAGIC         "question",
+-- MAGIC         "answer"
+-- MAGIC     )
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC from pyspark.sql import functions as F
+-- MAGIC
+-- MAGIC invalid_ids = [
+-- MAGIC     "324db725d6af2994045f64ee82caa30c7185b256177027456d668443c96b856d",
+-- MAGIC     "2d4cb65e3ec3b87ce9f85cedd4a83bfc72ee0db03761f1e8df06483015fc2150",
+-- MAGIC     "06e254320d8a8097ce77061f8e2e20105c4e65e7bc0de13747a83c2cdec8dd89",
+-- MAGIC     "3a33d322ae539c411b3960c15e7fe70864cdcb7b935d20e070f931ada68548eb",
+-- MAGIC     "ff495354c901973167309e78ad170b268da27690ebbabb48d8699d43b00779ce",
+-- MAGIC     "4236ea063bfa6156a539a776037caa5bed2f8c7f9759485499e13da1847e37cc",
+-- MAGIC     "5f82abc54428b4d8a74bce0696c5ab4f1674a3f616d87b16476d70b1c9b6d944",
+-- MAGIC     "e2f65b35660119ac7e9ccdfa2d10e09793dfc71dd88c66badb09ff1ec2a21c6b",
+-- MAGIC     "732cc7f049105fc12edac28afbb07a3064f530269b030a6cfb43f0c1517c0c3b",
+-- MAGIC     "e066b57531197b284f14184b575ee543bd766d1528130ce86969b70889ff3b84",
+-- MAGIC     "3f3523700c61b9cc14cc4a6547b803ac36ce3de1885da0b69c07e9e95da9d705",
+-- MAGIC     "b05013aef5feeaf518b89cdbc853ce180f1be8865767069324fa1fbfb89ffbbc",
+-- MAGIC     "a91e35b21a57e8042e1e44b0599041d2a6c57e61471671a8c076804f64e42a29",
+-- MAGIC     "23ade184adcd670bc62f70452f6810625ed009b32a6ca1d2246536edb2ff3002",
+-- MAGIC     "2706673fbc98fc26ce0831b818cd40cc4943beeea2e5be40a763068dced22a36",
+-- MAGIC     "48b39e70d48334da67ab65b2e93f4bac00897e2902f50c488bc1002faebcb290",
+-- MAGIC     "bcf0d8a0e51fe2d79dc5c502ab151ed1b7dac5367e628a2eab35b73e6cbee764",
+-- MAGIC     "7cd9d3e96a89e7008a3ef9628db4921cbdbc975c27edfbd01cf4035cf474c0fc",
+-- MAGIC     "abb0a393417881f49429b8bb92cb88f178e1322dc49dc93c6dc380e7ff2740d9",
+-- MAGIC     "db911b276dcdbfa6cb986d2d651e5fa86530fc332080ded92b9b9208f2f2e4bc",
+-- MAGIC     "2f7ff9067cb84ee9f335fa01e90919f79340ac03f6a850789ec567c494c53d86",
+-- MAGIC     "36ea922eb5414e7016f7074d1f248043ab753051deb52b7d488ae884408fa4da",
+-- MAGIC     "a3d155aa30ae9a0b8d003262d433f55c1aed1d6a93f30e233d0b912a2b05aad5",
+-- MAGIC     "1c0de84f49edaa20b16382c07987bbcbd091710e7f5450bda86ea16731427c87",
+-- MAGIC     "f40f563bd1246455d732696178b31151b24d3859801f6096bce508bc994d755b",
+-- MAGIC     "dfb2c0b00d8c48264b49313343ed1b5be53994b5c8cc935f263f65af1de10d91",
+-- MAGIC     "1aac4c2d76ac8dd905f91456b78d236dcbfe85ba182c7532258e4eeed9205f0e",
+-- MAGIC     "b220e395ef26613ae43a957dff94006e8b309e1e468e444a1d284af01f346d44",
+-- MAGIC     "3ad1f31d386605fef525dea6820b93e608419e955f53e7a72b503fa827dcc7a9",
+-- MAGIC     "a111616b5d7aa11268419238019e754cc3cf8c69cf63a30addd38632fee5dbd3"
+-- MAGIC ]
+-- MAGIC
+-- MAGIC extended_ground_truth_df = (
+-- MAGIC     extended_evaluation_df
+-- MAGIC     .withColumn(
+-- MAGIC         "expected_status",
+-- MAGIC         F.when(
+-- MAGIC             F.col("evaluation_id").isin(invalid_ids),
+-- MAGIC             F.lit("INVALID")
+-- MAGIC         ).otherwise(F.lit("VALID"))
+-- MAGIC     )
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC display(
+-- MAGIC     extended_ground_truth_df
+-- MAGIC     .groupBy("expected_status")
+-- MAGIC     .count()
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC extended_classifier_input_df = (
+-- MAGIC     extended_ground_truth_df
+-- MAGIC     .withColumn(
+-- MAGIC         "classifier_prompt",
+-- MAGIC         F.format_string(
+-- MAGIC             quality_prompt,
+-- MAGIC             F.col("question"),
+-- MAGIC             F.col("answer")
+-- MAGIC         )
+-- MAGIC     )
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC extended_predictions_raw_df = (
+-- MAGIC     extended_classifier_input_df
+-- MAGIC     .selectExpr(
+-- MAGIC         "*",
+-- MAGIC         """
+-- MAGIC         ai_query(
+-- MAGIC             'databricks-gpt-oss-20b',
+-- MAGIC             classifier_prompt,
+-- MAGIC             modelParameters => named_struct(
+-- MAGIC                 'temperature', 0.0,
+-- MAGIC                 'max_tokens', 500,
+-- MAGIC                 'reasoning_effort', 'low'
+-- MAGIC             ),
+-- MAGIC             responseFormat => '{"type":"json_object"}'
+-- MAGIC         ) AS classification
+-- MAGIC         """
+-- MAGIC     )
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC extended_prediction_rows = (
+-- MAGIC     extended_predictions_raw_df
+-- MAGIC     .select(
+-- MAGIC         "evaluation_id",
+-- MAGIC         "sample_group",
+-- MAGIC         "document_source",
+-- MAGIC         "question",
+-- MAGIC         "answer",
+-- MAGIC         "expected_status",
+-- MAGIC         "classification"
+-- MAGIC     )
+-- MAGIC     .collect()
+-- MAGIC )
+-- MAGIC
+-- MAGIC extended_predictions_materialized_df = spark.createDataFrame(
+-- MAGIC     extended_prediction_rows
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC print("Materialized predictions:", extended_predictions_materialized_df.count())
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC from pyspark.sql.types import StructType, StructField, StringType
+-- MAGIC
+-- MAGIC classification_schema = StructType([
+-- MAGIC     StructField("quality_status", StringType(), True),
+-- MAGIC     StructField("issue_type", StringType(), True),
+-- MAGIC     StructField("reason", StringType(), True)
+-- MAGIC ])
+-- MAGIC
+-- MAGIC extended_predictions_df = (
+-- MAGIC     extended_predictions_materialized_df
+-- MAGIC     .withColumn(
+-- MAGIC         "parsed_classification",
+-- MAGIC         F.from_json(
+-- MAGIC             F.col("classification"),
+-- MAGIC             classification_schema
+-- MAGIC         )
+-- MAGIC     )
+-- MAGIC     .withColumn(
+-- MAGIC         "predicted_status",
+-- MAGIC         F.upper(
+-- MAGIC             F.trim(
+-- MAGIC                 F.col("parsed_classification.quality_status")
+-- MAGIC             )
+-- MAGIC         )
+-- MAGIC     )
+-- MAGIC     .withColumn(
+-- MAGIC         "predicted_issue_type",
+-- MAGIC         F.upper(
+-- MAGIC             F.trim(
+-- MAGIC                 F.col("parsed_classification.issue_type")
+-- MAGIC             )
+-- MAGIC         )
+-- MAGIC     )
+-- MAGIC     .withColumn(
+-- MAGIC         "prediction_reason",
+-- MAGIC         F.col("parsed_classification.reason")
+-- MAGIC     )
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC display(
+-- MAGIC     extended_predictions_df
+-- MAGIC     .groupBy("predicted_status")
+-- MAGIC     .count()
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC extended_evaluation_results_df = (
+-- MAGIC     extended_predictions_df
+-- MAGIC     .withColumn(
+-- MAGIC         "is_correct",
+-- MAGIC         F.col("expected_status") == F.col("predicted_status")
+-- MAGIC     )
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC display(
+-- MAGIC     extended_evaluation_results_df
+-- MAGIC     .agg(
+-- MAGIC         F.count("*").alias("total_records"),
+-- MAGIC         F.sum(
+-- MAGIC             F.col("is_correct").cast("int")
+-- MAGIC         ).alias("correct_predictions"),
+-- MAGIC         F.round(
+-- MAGIC             F.avg(
+-- MAGIC                 F.col("is_correct").cast("double")
+-- MAGIC             ) * 100,
+-- MAGIC             2
+-- MAGIC         ).alias("accuracy_percentage")
+-- MAGIC     )
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC display(
+-- MAGIC     extended_evaluation_results_df
+-- MAGIC     .filter(~F.col("is_correct"))
+-- MAGIC     .select(
+-- MAGIC         "evaluation_id",
+-- MAGIC         "sample_group",
+-- MAGIC         "document_source",
+-- MAGIC         "question",
+-- MAGIC         "answer",
+-- MAGIC         "expected_status",
+-- MAGIC         "predicted_status",
+-- MAGIC         "predicted_issue_type",
+-- MAGIC         "prediction_reason"
+-- MAGIC     )
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC display(
+-- MAGIC     extended_evaluation_results_df
+-- MAGIC     .groupBy(
+-- MAGIC         "expected_status",
+-- MAGIC         "predicted_status"
+-- MAGIC     )
+-- MAGIC     .count()
+-- MAGIC     .orderBy(
+-- MAGIC         "expected_status",
+-- MAGIC         "predicted_status"
+-- MAGIC     )
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC display(
+-- MAGIC     extended_evaluation_results_df
+-- MAGIC     .filter(
+-- MAGIC         (F.col("expected_status") == "VALID") &
+-- MAGIC         (F.col("predicted_status") == "INVALID")
+-- MAGIC     )
+-- MAGIC     .select(
+-- MAGIC         "evaluation_id",
+-- MAGIC         "document_source",
+-- MAGIC         "question",
+-- MAGIC         "answer",
+-- MAGIC         "predicted_issue_type",
+-- MAGIC         "prediction_reason"
+-- MAGIC     )
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %md
+-- MAGIC ### Classifier decision
+-- MAGIC
+-- MAGIC The extended evaluation produced **109 correct predictions out of 112 (97.32%)**.
+-- MAGIC
+-- MAGIC Most importantly for the RAG knowledge base:
+-- MAGIC - known INVALID answers predicted VALID: **0**
+-- MAGIC - known VALID answers predicted INVALID: **3**
+-- MAGIC
+-- MAGIC This is a conservative error pattern: a small amount of useful content may be lost, but known bad answers did not pass the tested quality gate.
+-- MAGIC
+
+-- COMMAND ----------
+
+-- MAGIC %md
+-- MAGIC ## 14. Missing Question Focus
+-- MAGIC
+-- MAGIC `question_focus` is useful metadata, but it is not required when the actual question is complete and understandable. Missing focus therefore is **not** a rejection reason by itself.
+-- MAGIC
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC missing_question_focus_df = (
+-- MAGIC     answered_df
+-- MAGIC     .filter(
+-- MAGIC         F.col("question_focus").isNull()
+-- MAGIC         | (F.trim(F.col("question_focus")) == "")
+-- MAGIC         | (F.trim(F.col("question_focus")) == "\\N")
+-- MAGIC     )
+-- MAGIC     .select(
+-- MAGIC         "document_source",
+-- MAGIC         "question_focus",
+-- MAGIC         "question_type",
+-- MAGIC         "question",
+-- MAGIC         "answer"
+-- MAGIC     )
+-- MAGIC )
+-- MAGIC
+-- MAGIC print(
+-- MAGIC     "Answered rows with missing question_focus:",
+-- MAGIC     missing_question_focus_df.count()
+-- MAGIC )
+-- MAGIC
+-- MAGIC display(missing_question_focus_df)
+
+-- COMMAND ----------
+
+-- MAGIC %md
+-- MAGIC ## 15. Final Malformed-Question Validation
+-- MAGIC
+-- MAGIC The missing-focus inspection exposed additional questions whose subject was genuinely absent. The final rule targets only these missing-subject forms instead of rejecting harmless punctuation problems.
+-- MAGIC
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC malformed_questions_df = (
+-- MAGIC     answered_df
+-- MAGIC     .filter(
+-- MAGIC         F.col("question").rlike(
+-- MAGIC             r"(?i)^\s*(what is \(are\)|who is at risk for|how to prevent)\s*\?\s*\??\s*$"
+-- MAGIC         )
+-- MAGIC     )
+-- MAGIC     .select(
+-- MAGIC         "document_source",
+-- MAGIC         "question_focus",
+-- MAGIC         "question_type",
+-- MAGIC         "question",
+-- MAGIC         "answer"
+-- MAGIC     )
+-- MAGIC )
+-- MAGIC
+-- MAGIC print(
+-- MAGIC     "Genuinely malformed questions:",
+-- MAGIC     malformed_questions_df.count()
+-- MAGIC )
+-- MAGIC
+-- MAGIC display(
+-- MAGIC     malformed_questions_df.select(
+-- MAGIC         "document_source",
+-- MAGIC         "question_focus",
+-- MAGIC         "question_type",
+-- MAGIC         "question"
+-- MAGIC     )
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %md
+-- MAGIC ## 16. Very Long Answers
+-- MAGIC
+-- MAGIC Very long answers are not automatically low quality. They are preserved in Silver if otherwise valid. Their size is handled later in Gold through chunking for retrieval.
+-- MAGIC
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC answer_length_distribution_df = (
+-- MAGIC     answered_df
+-- MAGIC     .withColumn(
+-- MAGIC         "answer_length",
+-- MAGIC         F.length(F.col("answer"))
+-- MAGIC     )
+-- MAGIC )
+-- MAGIC
+-- MAGIC display(
+-- MAGIC     answer_length_distribution_df
+-- MAGIC     .select(
+-- MAGIC         F.min("answer_length").alias("min_length"),
+-- MAGIC         F.round(F.avg("answer_length"), 2).alias("avg_length"),
+-- MAGIC         F.expr("percentile_approx(answer_length, 0.50)").alias("median_length"),
+-- MAGIC         F.expr("percentile_approx(answer_length, 0.90)").alias("p90_length"),
+-- MAGIC         F.expr("percentile_approx(answer_length, 0.95)").alias("p95_length"),
+-- MAGIC         F.expr("percentile_approx(answer_length, 0.99)").alias("p99_length"),
+-- MAGIC         F.max("answer_length").alias("max_length")
+-- MAGIC     )
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC very_long_answers_df = (
+-- MAGIC     answer_length_distribution_df
+-- MAGIC     .filter(F.col("answer_length") > 8336)
+-- MAGIC     .select(
+-- MAGIC         "document_source",
+-- MAGIC         "question_focus",
+-- MAGIC         "question_type",
+-- MAGIC         "question",
+-- MAGIC         "answer",
+-- MAGIC         "answer_length"
+-- MAGIC     )
+-- MAGIC )
+-- MAGIC
+-- MAGIC print(
+-- MAGIC     "Answers longer than the 99th percentile:",
+-- MAGIC     very_long_answers_df.count()
+-- MAGIC )
+-- MAGIC
+-- MAGIC display(
+-- MAGIC     very_long_answers_df
+-- MAGIC     .orderBy(F.desc("answer_length"))
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %md
+-- MAGIC ## 17. Repeated Page-Level and Templated Answers
+-- MAGIC
+-- MAGIC Different questions can legitimately share identical answer text. Therefore Silver should **not deduplicate by answer alone**. Gold should carry question/topic context into retrieval text and can later avoid redundant identical chunks where appropriate.
+-- MAGIC
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC repeated_answer_groups_df = (
+-- MAGIC     answered_df
+-- MAGIC     .groupBy(
+-- MAGIC         "document_source",
+-- MAGIC         "answer"
+-- MAGIC     )
+-- MAGIC     .agg(
+-- MAGIC         F.count("*").alias("row_count"),
+-- MAGIC         F.countDistinct("question").alias("distinct_questions")
+-- MAGIC     )
+-- MAGIC     .filter(
+-- MAGIC         F.col("distinct_questions") > 1
+-- MAGIC     )
+-- MAGIC )
+-- MAGIC
+-- MAGIC display(
+-- MAGIC     repeated_answer_groups_df
+-- MAGIC     .groupBy("document_source")
+-- MAGIC     .agg(
+-- MAGIC         F.count("*").alias("repeated_answer_groups"),
+-- MAGIC         F.sum("row_count").alias("affected_rows")
+-- MAGIC     )
+-- MAGIC     .orderBy(F.desc("affected_rows"))
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC display(
+-- MAGIC     repeated_answer_groups_df
+-- MAGIC     .withColumn(
+-- MAGIC         "answer_preview",
+-- MAGIC         F.substring(F.col("answer"), 1, 500)
+-- MAGIC     )
+-- MAGIC     .select(
+-- MAGIC         "document_source",
+-- MAGIC         "row_count",
+-- MAGIC         "distinct_questions",
+-- MAGIC         "answer_preview"
+-- MAGIC     )
+-- MAGIC     .orderBy(F.desc("row_count"))
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %md
+-- MAGIC ## 18. Multi-Valued UMLS and Synonym Fields
+-- MAGIC
+-- MAGIC MedQuAD uses the pipe character `|` as the multi-value delimiter. Commas can occur inside a single synonym and therefore must not be used as the split delimiter.
+-- MAGIC
+-- MAGIC The final Silver representation should use:
+-- MAGIC - `umls_cui` → `ARRAY<STRING>`
+-- MAGIC - `umls_semantic_types` → `ARRAY<STRING>`
+-- MAGIC - `synonyms` → `ARRAY<STRING>`
+-- MAGIC - `umls_semantic_group` → `STRING`
+-- MAGIC
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC display(
+-- MAGIC     answered_df
+-- MAGIC     .select(
+-- MAGIC         "umls_cui",
+-- MAGIC         "umls_semantic_types",
+-- MAGIC         "umls_semantic_group",
+-- MAGIC         "synonyms"
+-- MAGIC     )
+-- MAGIC     .filter(
+-- MAGIC         F.col("umls_cui").contains("|")
+-- MAGIC         | F.col("umls_semantic_types").contains("|")
+-- MAGIC         | F.col("umls_semantic_group").contains("|")
+-- MAGIC         | F.col("synonyms").contains("|")
+-- MAGIC     )
+-- MAGIC     .limit(50)
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %python
+-- MAGIC
+-- MAGIC display(
+-- MAGIC     answered_df.agg(
+-- MAGIC         F.sum(
+-- MAGIC             F.when(F.col("umls_cui").contains("|"), 1).otherwise(0)
+-- MAGIC         ).alias("multi_umls_cui"),
+-- MAGIC
+-- MAGIC         F.sum(
+-- MAGIC             F.when(F.col("umls_semantic_types").contains("|"), 1).otherwise(0)
+-- MAGIC         ).alias("multi_semantic_types"),
+-- MAGIC
+-- MAGIC         F.sum(
+-- MAGIC             F.when(F.col("umls_semantic_group").contains("|"), 1).otherwise(0)
+-- MAGIC         ).alias("multi_semantic_groups"),
+-- MAGIC
+-- MAGIC         F.sum(
+-- MAGIC             F.when(F.col("synonyms").contains("|"), 1).otherwise(0)
+-- MAGIC         ).alias("multi_synonyms")
+-- MAGIC     )
+-- MAGIC )
+
+-- COMMAND ----------
+
+-- MAGIC %md
+-- MAGIC ## 19. Final EDA Decisions and Next Step
+-- MAGIC
+-- MAGIC The EDA supports the following Silver rules:
+-- MAGIC
+-- MAGIC | Problem | Decision |
+-- MAGIC |---|---|
+-- MAGIC | Missing answer | Reject/quarantine from Silver QA data |
+-- MAGIC | Optional missing metadata | Normalize to `NULL`; do not reject |
+-- MAGIC | Same normalized question + same normalized answer | Keep one deterministic representative |
+-- MAGIC | Same question + different answer | Keep all distinct answers |
+-- MAGIC | Semantically non-responsive answer | LLM classifier → quarantine when `INVALID` |
+-- MAGIC | Short answer | Keep when semantically valid |
+-- MAGIC | Duplicate `? ?` punctuation | Normalize punctuation and keep |
+-- MAGIC | Question with missing subject | Reject/quarantine |
+-- MAGIC | Missing `question_focus` | Keep when the question itself is usable |
+-- MAGIC | Very long answer | Keep in Silver; chunk in Gold |
+-- MAGIC | Same answer reused across different questions | Keep the QA relationships |
+-- MAGIC | Pipe-delimited UMLS/synonym values | Convert true multi-value fields to arrays |
+-- MAGIC
+-- MAGIC ### Next step
+-- MAGIC
+-- MAGIC The EDA/data-quality investigation is now complete. The next notebook should implement the **Silver transformation and quarantine tables** using these decisions.
+-- MAGIC
